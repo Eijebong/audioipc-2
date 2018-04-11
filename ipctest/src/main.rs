@@ -49,7 +49,7 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    env_logger::init().unwrap();
+    env_logger::init();
 
     println!("Cubeb AudioServer...");
 
