@@ -9,7 +9,7 @@ use bytes::{Bytes, BytesMut, IntoBuf};
 use futures::{AsyncSink, Poll, Sink, StartSend, Stream};
 use std::collections::VecDeque;
 use std::{fmt, io};
-use tokio_io::{AsyncRead, AsyncWrite};
+use futures_io::{AsyncRead, AsyncWrite};
 
 const INITIAL_CAPACITY: usize = 1024;
 const BACKPRESSURE_THRESHOLD: usize = 4 * INITIAL_CAPACITY;
@@ -45,7 +45,7 @@ where
             self.set_frame();
         }
 
-        trace!("pending frames: {:?}", self.frames);
+        trace!("1: pending frames: {:?}", self.frames);
 
         let mut processed = 0;
 
@@ -54,7 +54,7 @@ where
                 Some(frame) => {
                     trace!("sending msg {:?}", frame.msgs);
                     let mut msgs = frame.msgs.clone().into_buf();
-                    try_ready!(self.io.write_buf(&mut msgs))
+                    ready!(self.io.write_buf(&mut msgs))
                 }
                 _ => {
                     // No pending frames.
@@ -81,7 +81,7 @@ where
             }
         }
         trace!("process {} frames", processed);
-        trace!("pending frames: {:?}", self.frames);
+        trace!("2: pending frames: {:?}", self.frames);
 
         Ok(().into())
     }
@@ -139,7 +139,7 @@ where
             // Otherwise, try to read more data and try again. Make sure we've
             // got room for at least one byte to read to ensure that we don't
             // get a spurious 0 that looks like EOF
-            let n = try_ready!(self.io.read_buf(&mut self.read_buf));
+            let n = ready!(self.io.read_buf(&mut self.read_buf));
 
             if n == 0 {
                 self.eof = true;
@@ -207,7 +207,7 @@ where
     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
         trace!("flushing framed transport");
 
-        try_ready!(self.do_write());
+        ready!(self.do_write());
 
         try_nb!(self.io.flush());
 
@@ -216,7 +216,7 @@ where
     }
 
     fn close(&mut self) -> Poll<(), Self::SinkError> {
-        try_ready!(self.poll_complete());
+        ready!(self.poll_complete());
         self.io.shutdown()
     }
 }

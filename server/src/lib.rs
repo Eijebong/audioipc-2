@@ -14,14 +14,13 @@ use audioipc::core;
 use audioipc::platformhandle_passing::framed_with_platformhandles;
 use audioipc::rpc;
 use audioipc::{MessageStream, PlatformHandle, PlatformHandleType};
-use futures::sync::oneshot;
-use futures::Future;
+use tokio::sync::oneshot;
 use once_cell::sync::Lazy;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Mutex;
-use tokio::reactor;
+use tokio::runtime;
 
 mod server;
 
@@ -46,7 +45,7 @@ pub mod errors {
         foreign_links {
             Cubeb(cubeb_core::Error);
             Io(::std::io::Error);
-            Canceled(::futures::sync::oneshot::Canceled);
+            Canceled(::futures::channel::oneshot::Canceled);
         }
     }
 }
@@ -63,7 +62,7 @@ fn run() -> Result<ServerWrapper> {
 
     let callback_thread = core::spawn_thread(
         "AudioIPC Callback RPC",
-        || {
+        |_cx| {
             match promote_current_thread_to_real_time(0, 48000) {
                 Ok(_) => {}
                 Err(_) => {
@@ -84,7 +83,7 @@ fn run() -> Result<ServerWrapper> {
     })?;
 
     let core_thread =
-        core::spawn_thread("AudioIPC Server RPC", move || Ok(()), || {}).or_else(|e| {
+        core::spawn_thread("AudioIPC Server RPC", move |_cx| Ok(()), || {}).or_else(|e| {
             debug!("Failed to cubeb audio core event loop thread: {:?}", e);
             Err(e)
         })?;
@@ -126,27 +125,34 @@ pub extern "C" fn audioipc_server_new_client(p: *mut c_void) -> PlatformHandleTy
     // to the caller.
     MessageStream::anonymous_ipc_pair()
         .and_then(|(ipc_server, ipc_client)| {
+            use futures_util::TryFutureExt;
             // Spawn closure to run on same thread as reactor::Core
             // via remote handle.
             wrapper
                 .core_thread
                 .handle()
-                .spawn(futures::future::lazy(|| {
+                .spawn(futures::future::lazy(|_cx| {
                     trace!("Incoming connection");
-                    let handle = reactor::Handle::default();
-                    ipc_server.into_tokio_ipc(&handle)
-                    .and_then(|sock| {
-                        let transport = framed_with_platformhandles(sock, Default::default());
-                        rpc::bind_server(transport, server::CubebServer::new(core_handle));
-                        Ok(())
-                    }).map_err(|_| ())
+
+                    let pool = futures::executor::LocalPool::new();
+                    use futures_util::task::LocalSpawnExt;
+                    pool.spawner().spawn_local_with_handle(
+                        futures::future::lazy(|_| {
+                            let handle = runtime::Handle::current();
+                            ipc_server.into_tokio_ipc(&handle)
+                        })
+                        .and_then(|sock| {
+                            let transport = framed_with_platformhandles(sock, Default::default());
+                            rpc::bind_server(transport, server::CubebServer::new(core_handle))
+                            .and_then(|_| async { wait_tx.send(()); Ok(()) } )
+                        })
+                    ).unwrap()
                     // Notify waiting thread that server has been registered.
-                    .and_then(|_| wait_tx.send(()))
-                }))
-                .expect("Failed to spawn CubebServer");
+                }));
             // Wait for notification that server has been registered
             // with reactor::Core.
-            let _ = wait_rx.wait();
+            let _ = futures::executor::block_on(wait_rx);
+            println!("Server seems OK");
             Ok(unsafe { PlatformHandle::from(ipc_client).into_raw() })
         })
         .unwrap_or(audioipc::INVALID_HANDLE_VALUE)

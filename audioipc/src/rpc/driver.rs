@@ -4,13 +4,15 @@
 // accompanying file LICENSE for details
 
 use crate::rpc::Handler;
-use futures::{Async, AsyncSink, Future, Poll, Sink, Stream};
+use std::task::{Context, Poll};
+use futures::{Future, Sink, Stream};
+use std::pin::Pin;
 use std::fmt;
 use std::io;
 
 pub struct Driver<T>
 where
-    T: Handler,
+    T: Handler + Unpin,
 {
     // Glue
     handler: T,
@@ -24,7 +26,7 @@ where
 
 impl<T> Driver<T>
 where
-    T: Handler,
+    T: Handler + Unpin,
 {
     /// Create a new rpc driver with the given service and transport.
     pub fn new(handler: T) -> Driver<T> {
@@ -41,9 +43,9 @@ where
     }
 
     /// Process incoming messages off the transport.
-    fn receive_incoming(&mut self) -> io::Result<()> {
+    fn receive_incoming(&mut self, cx: &mut Context) -> io::Result<()> {
         while self.run {
-            if let Async::Ready(req) = self.handler.transport().poll()? {
+            if let Poll::Ready(req) = self.handler.transport().poll_next(cx)? {
                 self.process_incoming(req)?;
             } else {
                 break;
@@ -79,37 +81,41 @@ where
     }
 
     /// Send outgoing messages to the transport.
-    fn send_outgoing(&mut self) -> io::Result<()> {
+    fn send_outgoing(&mut self, cx: &mut Context) -> io::Result<()> {
         trace!("send_responses");
         loop {
-            match self.handler.produce()? {
-                Async::Ready(Some(message)) => {
+            match self.handler.produce(cx)? {
+                Poll::Ready(Some(message)) => {
                     trace!("  --> got message");
-                    self.process_outgoing(message)?;
+                    self.process_outgoing(message, cx)?;
                 }
-                Async::Ready(None) => {
+                Poll::Ready(None) => {
                     trace!("  --> got None");
                     // The service is done with the connection.
                     self.run = false;
                     break;
                 }
                 // Nothing to dispatch
-                Async::NotReady => break,
+                Poll::Pending => {
+                    cx.waker().wake_by_ref();
+                    break
+                }
             }
         }
 
         Ok(())
     }
 
-    fn process_outgoing(&mut self, message: T::Out) -> io::Result<()> {
+    fn process_outgoing(&mut self, message: T::Out, cx: &mut Context) -> io::Result<()> {
         trace!("process_outgoing");
-        assert_send(&mut self.handler.transport(), message)?;
+        self.handler.transport().poll_ready(cx)?;
+        assert_send(self.handler.transport(), message)?;
 
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.is_flushed = self.handler.transport().poll_complete()?.is_ready();
+    fn flush(&mut self, cx: &mut Context) -> io::Result<()> {
+        self.is_flushed = self.handler.transport().poll_flush(cx)?.is_ready();
 
         // TODO:
         Ok(())
@@ -122,37 +128,37 @@ where
 
 impl<T> Future for Driver<T>
 where
-    T: Handler,
+    T: Handler + Unpin,
 {
-    type Item = ();
-    type Error = io::Error;
+    type Output = Result<(), io::Error>;
 
-    fn poll(&mut self) -> Poll<(), Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         trace!("rpc::Driver::tick");
 
         // First read off data from the socket
-        self.receive_incoming()?;
+        self.receive_incoming(cx)?;
 
         // Handle completed responses
-        self.send_outgoing()?;
+        self.send_outgoing(cx)?;
 
         // Try flushing buffered writes
-        self.flush()?;
+        self.flush(cx)?;
 
         if self.is_done() {
             trace!("  --> is done.");
-            return Ok(().into());
+            return Poll::Ready(Ok(()));
         }
 
         // Tick again later
-        Ok(Async::NotReady)
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
-fn assert_send<S: Sink>(s: &mut S, item: S::SinkItem) -> Result<(), S::SinkError> {
-    match s.start_send(item)? {
-        AsyncSink::Ready => Ok(()),
-        AsyncSink::NotReady(_) => panic!(
+fn assert_send<Item, S: Sink<Item>>(s: Pin<&mut S>, item: Item) -> Result<(), S::Error> {
+    match s.start_send(item) {
+        Ok(()) => Ok(()),
+        Err(_) => panic!(
             "sink reported itself as ready after `poll_ready` but was \
              then unable to accept a message"
         ),
@@ -161,7 +167,7 @@ fn assert_send<S: Sink>(s: &mut S, item: S::SinkItem) -> Result<(), S::SinkError
 
 impl<T> fmt::Debug for Driver<T>
 where
-    T: Handler + fmt::Debug,
+    T: Handler + fmt::Debug + Unpin,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("rpc::Handler")

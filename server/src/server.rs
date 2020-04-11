@@ -19,9 +19,8 @@ use audioipc::shm::{SharedMemReader, SharedMemWriter};
 use audioipc::{MessageStream, PlatformHandle};
 use cubeb_core as cubeb;
 use cubeb_core::ffi;
-use futures::future::{self, FutureResult};
-use futures::sync::oneshot;
-use futures::Future;
+use futures::future::{self, Future};
+use tokio::sync::oneshot;
 use slab;
 use std::cell::RefCell;
 use std::convert::From;
@@ -31,8 +30,7 @@ use std::os::raw::{c_long, c_void};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{panic, slice};
-use tokio::reactor;
-use tokio::runtime::current_thread;
+use tokio::runtime;
 
 use crate::errors::*;
 
@@ -261,14 +259,14 @@ impl ServerStreamCallbacks {
 
         self.input_shm.write(input).unwrap();
 
-        let r = self
+        let r = futures::executor::block_on(self
             .rpc
             .call(CallbackReq::Data {
                 nframes,
                 input_frame_size: self.input_frame_size as usize,
                 output_frame_size: self.output_frame_size as usize,
-            })
-            .wait();
+            }));
+
 
         match r {
             Ok(CallbackResp::Data(frames)) => {
@@ -291,7 +289,7 @@ impl ServerStreamCallbacks {
 
     fn state_callback(&mut self, state: cubeb::State) {
         trace!("Stream state callback: {:?}", state);
-        let r = self.rpc.call(CallbackReq::State(state.into())).wait();
+        let r = futures::executor::block_on(self.rpc.call(CallbackReq::State(state.into())));
         match r {
             Ok(CallbackResp::State) => {}
             _ => {
@@ -302,7 +300,7 @@ impl ServerStreamCallbacks {
 
     fn device_change_callback(&mut self) {
         trace!("Stream device change callback");
-        let r = self.rpc.call(CallbackReq::DeviceChange).wait();
+        let r = futures::executor::block_on(self.rpc.call(CallbackReq::DeviceChange));
         match r {
             Ok(CallbackResp::DeviceChange) => {}
             _ => {
@@ -354,15 +352,16 @@ impl CubebServerCallbacks {
             "Sending device collection ({:?}) changed event",
             device_type
         );
-        let _ = self
+        let task = tokio::task::spawn(self
             .rpc
-            .call(DeviceCollectionReq::DeviceChange(device_type))
-            .wait();
+            .call(DeviceCollectionReq::DeviceChange(device_type)));
+
+        futures::executor::block_on(task).unwrap().unwrap();
     }
 }
 
 pub struct CubebServer {
-    handle: current_thread::Handle,
+    handle: tokio::runtime::Handle,
     streams: StreamSlab,
     remote_pid: Option<u32>,
     cbs: Option<Rc<RefCell<CubebServerCallbacks>>>,
@@ -372,7 +371,7 @@ pub struct CubebServer {
 impl rpc::Server for CubebServer {
     type Request = ServerMessage;
     type Response = ClientMessage;
-    type Future = FutureResult<Self::Response, ()>;
+    type Future = Box<dyn Future<Output=std::result::Result<Self::Response, ()>> + Unpin>;
     type Transport = FramedWithPlatformHandles<
         audioipc::AsyncMessageStream,
         LengthDelimitedCodec<Self::Response, Self::Request>,
@@ -383,7 +382,7 @@ impl rpc::Server for CubebServer {
             Err(_) => error(cubeb::Error::error()),
             Ok(ref context) => self.process_msg(context, manager, &req),
         });
-        future::ok(resp)
+        Box::new(future::ok(resp))
     }
 }
 
@@ -406,7 +405,7 @@ macro_rules! try_stream {
 }
 
 impl CubebServer {
-    pub fn new(handle: current_thread::Handle) -> Self {
+    pub fn new(handle: tokio::runtime::Handle) -> Self {
         CubebServer {
             handle,
             streams: StreamSlab::with_capacity(STREAM_CONN_CHUNK_SIZE),
@@ -566,21 +565,19 @@ impl CubebServer {
 
                     let (tx, rx) = oneshot::channel();
                     self.handle
-                        .spawn(futures::future::lazy(move || {
-                            let handle = reactor::Handle::default();
+                        .spawn(futures::future::lazy(move |_cx| {
+                            let handle = runtime::Handle::current();
                             let stream = ipc_server.into_tokio_ipc(&handle).unwrap();
                             let transport = framed(stream, Default::default());
                             let rpc = rpc::bind_client::<DeviceCollectionClient>(transport);
                             drop(tx.send(rpc));
-                            Ok(())
-                        }))
-                        .expect("Failed to spawn DeviceCollectionClient");
+                        }));
 
                     // TODO: The lowest comms layer expects exactly 3 PlatformHandles, but we only
                     // need one here.  Send some dummy handles over for the other side to discard.
                     let (dummy1, dummy2) =
                         MessageStream::anonymous_ipc_pair().expect("need dummy IPC pair");
-                    if let Ok(rpc) = rx.wait() {
+                    if let Ok(rpc) = futures::executor::block_on(rx) {
                         self.cbs = Some(Rc::new(RefCell::new(CubebServerCallbacks {
                             rpc,
                             devtype: cubeb::DeviceType::empty(),
@@ -701,17 +698,15 @@ impl CubebServer {
 
         let (tx, rx) = oneshot::channel();
         self.handle
-            .spawn(futures::future::lazy(move || {
-                let handle = reactor::Handle::default();
+            .spawn(futures::future::lazy(move |_| {
+                let handle = runtime::Handle::current();
                 let stream = ipc_server.into_tokio_ipc(&handle).unwrap();
                 let transport = framed(stream, Default::default());
                 let rpc = rpc::bind_client::<CallbackClient>(transport);
                 drop(tx.send(rpc));
-                Ok(())
-            }))
-            .expect("Failed to spawn CallbackClient");
+            }));
 
-        let rpc: rpc::ClientProxy<CallbackReq, CallbackResp> = match rx.wait() {
+        let rpc: rpc::ClientProxy<CallbackReq, CallbackResp> = match futures::executor::block_on(rx) {
             Ok(rpc) => rpc,
             Err(_) => bail!("Failed to create callback rpc."),
         };

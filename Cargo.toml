@@ -1,3 +1,6 @@
 [workspace]
 members = ["audioipc", "client", "server", "ipctest"]
 
+[patch.crates-io]
+cubeb-sys = { path = "../cubeb-rs/cubeb-sys" }
+

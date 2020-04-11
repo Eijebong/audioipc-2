@@ -8,7 +8,7 @@ use mio_named_pipes;
 use std::os::windows::fs::*;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio_io::{AsyncRead, AsyncWrite};
+use futures_io::{AsyncRead, AsyncWrite};
 use winapi::um::winbase::FILE_FLAG_OVERLAPPED;
 
 #[derive(Debug)]
@@ -81,17 +81,17 @@ impl std::io::Write for AsyncMessageStream {
 }
 
 impl AsyncRead for AsyncMessageStream {
-    fn read_buf<B: bytes::BufMut>(&mut self, buf: &mut B) -> futures::Poll<usize, std::io::Error> {
+    fn read_buf<B: bytes::BufMut>(&mut self, buf: &mut B) -> core::task::Poll<usize, std::io::Error> {
         <tokio_named_pipes::NamedPipe>::read_buf(&mut self.0, buf)
     }
 }
 
 impl AsyncWrite for AsyncMessageStream {
-    fn shutdown(&mut self) -> futures::Poll<(), std::io::Error> {
+    fn shutdown(&mut self) -> core::task::Poll<(), std::io::Error> {
         <tokio_named_pipes::NamedPipe>::shutdown(&mut self.0)
     }
 
-    fn write_buf<B: bytes::Buf>(&mut self, buf: &mut B) -> futures::Poll<usize, std::io::Error> {
+    fn write_buf<B: bytes::Buf>(&mut self, buf: &mut B) -> core::task::Poll<usize, std::io::Error> {
         <tokio_named_pipes::NamedPipe>::write_buf(&mut self.0, buf)
     }
 }

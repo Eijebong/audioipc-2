@@ -23,15 +23,15 @@ use cubeb_backend::{
     Stream, StreamParams, StreamParamsRef,
 };
 use futures::Future;
-use futures_cpupool::{CpuFuture, CpuPool};
+use futures::executor::ThreadPool;
+use futures_util::task::SpawnExt;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::{fmt, io, mem, ptr};
-use tokio::reactor;
-use tokio::runtime::current_thread;
+use tokio::runtime;
 
 struct CubebClient;
 
@@ -53,7 +53,7 @@ pub struct ClientContext {
     _ops: *const Ops,
     rpc: rpc::ClientProxy<ServerMessage, ClientMessage>,
     core: core::CoreThread,
-    cpu_pool: CpuPool,
+    cpu_pool: ThreadPool,
     backend_id: CString,
     device_collection_rpc: bool,
     input_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
@@ -62,7 +62,7 @@ pub struct ClientContext {
 
 impl ClientContext {
     #[doc(hidden)]
-    pub fn handle(&self) -> current_thread::Handle {
+    pub fn handle(&self) -> runtime::Handle {
         self.core.handle()
     }
 
@@ -72,7 +72,7 @@ impl ClientContext {
     }
 
     #[doc(hidden)]
-    pub fn cpu_pool(&self) -> CpuPool {
+    pub fn cpu_pool(&self) -> ThreadPool {
         self.cpu_pool.clone()
     }
 }
@@ -134,13 +134,13 @@ struct DeviceCollectionCallback {
 struct DeviceCollectionServer {
     input_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
     output_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
-    cpu_pool: CpuPool,
+    cpu_pool: ThreadPool,
 }
 
 impl rpc::Server for DeviceCollectionServer {
     type Request = DeviceCollectionReq;
     type Response = DeviceCollectionResp;
-    type Future = CpuFuture<Self::Response, ()>;
+    type Future = Box<dyn Future<Output=std::result::Result<Self::Response, ()>> + Unpin>;
     type Transport =
         Framed<audioipc::AsyncMessageStream, LengthDelimitedCodec<Self::Response, Self::Request>>;
 
@@ -163,7 +163,7 @@ impl rpc::Server for DeviceCollectionServer {
                     (dcb.cb, dcb.user_ptr)
                 };
 
-                self.cpu_pool.spawn_fn(move || {
+                Box::new(self.cpu_pool.spawn_with_handle(futures::future::lazy(move |_| {
                     run_in_callback(|| {
                         if devtype.contains(cubeb_backend::DeviceType::INPUT) {
                             unsafe {
@@ -178,7 +178,7 @@ impl rpc::Server for DeviceCollectionServer {
                     });
 
                     Ok(DeviceCollectionResp::DeviceChange)
-                })
+                })).unwrap())
             }
         }
     }
@@ -211,8 +211,8 @@ impl ContextOps for ClientContext {
 
         let core = core::spawn_thread(
             "AudioIPC Client RPC",
-            move || {
-                let handle = reactor::Handle::default();
+            move |_cx| {
+                let handle = runtime::Handle::current();
 
                 register_thread(thread_create_callback);
 
@@ -235,13 +235,13 @@ impl ContextOps for ClientContext {
             .unwrap_or_else(|_| "(remote error)".to_string());
         let backend_id = CString::new(backend_id).expect("backend_id query failed");
 
-        let cpu_pool = futures_cpupool::Builder::new()
+        let cpu_pool = futures::executor::ThreadPool::builder()
             .name_prefix("AudioIPC")
-            .after_start(move || promote_and_register_thread(&rpc2, thread_create_callback))
-            .before_stop(move || unregister_thread(thread_destroy_callback))
+            .after_start(move |_| promote_and_register_thread(&rpc2, thread_create_callback))
+            .before_stop(move |_| unregister_thread(thread_destroy_callback))
             .pool_size(params.pool_size)
             .stack_size(params.stack_size)
-            .create();
+            .create().expect("Can't create thread pool");
 
         let ctx = Box::new(ClientContext {
             _ops: &CLIENT_OPS as *const _,
@@ -401,15 +401,13 @@ impl ContextOps for ClientContext {
 
             let (wait_tx, wait_rx) = mpsc::channel();
             self.handle()
-                .spawn(futures::future::lazy(move || {
-                    let handle = reactor::Handle::default();
+                .spawn(futures::future::lazy(move |_cx| {
+                    let handle = runtime::Handle::current();
                     let stream = stream.into_tokio_ipc(&handle).unwrap();
                     let transport = framed(stream, Default::default());
                     rpc::bind_server(transport, server);
                     wait_tx.send(()).unwrap();
-                    Ok(())
-                }))
-                .expect("Failed to spawn DeviceCollectionServer");
+                }));
             wait_rx.recv().unwrap();
             self.device_collection_rpc = true;
         }

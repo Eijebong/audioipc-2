@@ -41,15 +41,21 @@
 
 use crate::rpc::driver::Driver;
 use crate::rpc::Handler;
-use futures::{Async, Future, Poll, Sink, Stream};
+use futures::{Future, Sink, Stream};
+use core::task::{Context, Poll};
 use std::collections::VecDeque;
 use std::io;
-use tokio::runtime::current_thread;
+use futures_util::sink::SinkExt;
 
+
+use std::pin::Pin;
 /// Bind an async I/O object `io` to the `server`.
-pub fn bind_server<S>(transport: S::Transport, server: S)
+pub fn bind_server<S>(transport: S::Transport, server: S) -> impl Future<Output=Result<(), std::io::Error>>
 where
-    S: Server,
+    S: Server + Unpin,
+    S::Response: Unpin,
+    S::Transport: Unpin,
+    S::Future: Unpin
 {
     let fut = {
         let handler = ServerHandler {
@@ -60,8 +66,7 @@ where
         Driver::new(handler)
     };
 
-    // Spawn the RPC driver into task
-    current_thread::spawn(fut.map_err(|_| ()))
+    fut
 }
 
 pub trait Server: 'static {
@@ -72,13 +77,14 @@ pub trait Server: 'static {
     type Response: 'static;
 
     /// Future
-    type Future: Future<Item = Self::Response, Error = ()>;
+    type Future: Future<Output = Result<Self::Response, ()>> + Unpin;
 
     /// The message transport, which works with async I/O objects of
     /// type `A`.
     type Transport: 'static
-        + Stream<Item = Self::Request, Error = io::Error>
-        + Sink<SinkItem = Self::Response, SinkError = io::Error>;
+        + Stream<Item = Result<Self::Request, io::Error>>
+        + Sink<Self::Response, Error = io::Error>
+        + Unpin;
 
     /// Process the request and return the response asynchronously.
     fn process(&mut self, req: Self::Request) -> Self::Future;
@@ -88,27 +94,28 @@ pub trait Server: 'static {
 
 struct ServerHandler<S>
 where
-    S: Server,
+    S: Server + Unpin,
 {
     // The service handling the connection
     server: S,
     // The transport responsible for sending/receving messages over the wire
     transport: S::Transport,
     // FIFO of "in flight" responses to requests.
-    in_flight: VecDeque<InFlight<S::Future>>,
+    in_flight: VecDeque<InFlight<S::Response, S::Future>>,
 }
 
 impl<S> Handler for ServerHandler<S>
 where
-    S: Server,
+    S: Server + Unpin,
 {
     type In = S::Request;
     type Out = S::Response;
     type Transport = S::Transport;
 
     /// Mutable reference to the transport
-    fn transport(&mut self) -> &mut Self::Transport {
-        &mut self.transport
+    fn transport(&mut self) -> Pin<&mut Self::Transport> {
+        // TODO: Dfinitely wrong
+        Pin::new(&mut self.transport)
     }
 
     /// Consume a message
@@ -122,12 +129,12 @@ where
     }
 
     /// Produce a message
-    fn produce(&mut self) -> Poll<Option<Self::Out>, io::Error> {
+    fn produce(&mut self, cx: &mut Context) -> Poll<Result<Option<Self::Out>, io::Error>> {
         trace!("ServerHandler::produce");
 
         // Make progress on pending responses
         for pending in &mut self.in_flight {
-            pending.poll();
+            pending.poll(cx);
         }
 
         // Is the head of the queue ready?
@@ -135,15 +142,16 @@ where
             Some(&InFlight::Done(_)) => {}
             _ => {
                 trace!("  --> not ready");
-                return Ok(Async::NotReady);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
         }
 
         // Return the ready response
         match self.in_flight.pop_front() {
-            Some(InFlight::Done(res)) => {
+            Some(InFlight::Done(Ok(res))) => {
                 trace!("  --> received response");
-                Ok(Async::Ready(Some(res)))
+                Poll::Ready(Ok(Some(res)))
             }
             _ => panic!(),
         }
@@ -155,7 +163,7 @@ where
     }
 }
 
-impl<S: Server> Drop for ServerHandler<S> {
+impl<S: Server + Unpin> Drop for ServerHandler<S> {
     fn drop(&mut self) {
         let _ = self.transport.close();
         self.in_flight.clear();
@@ -164,21 +172,24 @@ impl<S: Server> Drop for ServerHandler<S> {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-enum InFlight<F: Future<Error = ()>> {
+enum InFlight<R, F: Future<Output=Result<R, ()>> + Unpin> {
     Active(F),
-    Done(F::Item),
+    Done(F::Output),
 }
 
-impl<F: Future<Error = ()>> InFlight<F> {
-    fn poll(&mut self) {
+impl<R, F: Future<Output=Result<R, ()>> + Unpin> InFlight<R, F> {
+    fn poll(&mut self, cx: &mut Context) {
         let res = match *self {
-            InFlight::Active(ref mut f) => match f.poll() {
-                Ok(Async::Ready(e)) => e,
-                Err(_) => unreachable!(),
-                Ok(Async::NotReady) => return,
+            InFlight::Active(ref mut f) => match std::pin::Pin::new(f).poll(cx) {
+                Poll::Ready(Ok(e)) => e,
+                Poll::Ready(Err(_)) => unreachable!(),
+                Poll::Pending => {
+                    cx.waker().wake_by_ref();
+                    return
+                }
             },
             _ => return,
         };
-        *self = InFlight::Done(res);
+        *self = InFlight::Done(Ok(res));
     }
 }

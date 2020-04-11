@@ -7,11 +7,13 @@ use crate::async_msg::{AsyncRecvMsg, AsyncSendMsg};
 use crate::cmsg;
 use crate::codec::Codec;
 use crate::messages::AssocRawPlatformHandle;
-use bytes::{Bytes, BytesMut, IntoBuf};
-use futures::{AsyncSink, Poll, Sink, StartSend, Stream};
+use bytes::{Bytes, BytesMut};
+use futures::{Sink, Stream};
+use std::task::{Context, Poll};
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::{fmt, io, mem};
+use std::pin::Pin;
 
 const INITIAL_CAPACITY: usize = 1024;
 const BACKPRESSURE_THRESHOLD: usize = 4 * INITIAL_CAPACITY;
@@ -47,7 +49,7 @@ impl IncomingFds {
                 return None;
             }
 
-            self.recv_fds = Some(cmsg::iterator(self.cmsg.take().freeze()));
+            self.recv_fds = Some(cmsg::iterator(self.cmsg.split().freeze()));
         }
     }
 
@@ -84,14 +86,14 @@ where
     A: AsyncSendMsg,
 {
     // If there is a buffered frame, try to write it to `A`
-    fn do_write(&mut self) -> Poll<(), io::Error> {
+    fn do_write(&mut self, cx: &mut Context) -> Poll<Result<(), io::Error>> {
         trace!("do_write...");
         // Create a frame from any pending message in `write_buf`.
         if !self.write_buf.is_empty() {
             self.set_frame(None);
         }
 
-        trace!("pending frames: {:?}", self.frames);
+        trace!("3: pending frames: {:?}", self.frames);
 
         let mut processed = 0;
 
@@ -99,17 +101,16 @@ where
             let n = match self.frames.front() {
                 Some(frame) => {
                     trace!("sending msg {:?}, fds {:?}", frame.msgs, frame.fds);
-                    let mut msgs = frame.msgs.clone().into_buf();
+                    let mut msgs = frame.msgs.clone();
                     let fds = match frame.fds {
                         Some(ref fds) => fds.clone(),
                         None => Bytes::new(),
-                    }
-                    .into_buf();
-                    try_ready!(self.io.send_msg_buf(&mut msgs, &fds))
+                    };
+                    futures::ready!(self.io.send_msg_buf(cx, &mut msgs, &fds))?
                 }
                 _ => {
                     // No pending frames.
-                    return Ok(().into());
+                    return Poll::Ready(Ok(()));
                 }
             };
 
@@ -143,9 +144,9 @@ where
             }
         }
         trace!("process {} frames", processed);
-        trace!("pending frames: {:?}", self.frames);
+        trace!("4: pending frames: {:?}", self.frames);
 
-        Ok(().into())
+        Poll::Ready(Ok(()))
     }
 
     fn set_frame(&mut self, fds: Option<Bytes>) {
@@ -155,7 +156,7 @@ where
             return;
         }
 
-        let msgs = self.write_buf.take().freeze();
+        let msgs = self.write_buf.split().freeze();
         trace!("set_frame: msgs={:?} fds={:?}", msgs, fds);
 
         self.frames.push_back(Frame { msgs, fds });
@@ -164,82 +165,72 @@ where
 
 impl<A, C> Stream for FramedWithPlatformHandles<A, C>
 where
-    A: AsyncRecvMsg,
-    C: Codec,
+    A: AsyncRecvMsg + Unpin,
+    C: Codec + Unpin,
     C::Out: AssocRawPlatformHandle,
 {
-    type Item = C::Out;
-    type Error = io::Error;
+    type Item = Result<C::Out, io::Error>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let self_ = &mut *self;
         loop {
             // Repeatedly call `decode` or `decode_eof` as long as it is
             // "readable". Readable is defined as not having returned `None`. If
             // the upstream has returned EOF, and the decoder is no longer
             // readable, it can be assumed that the decoder will never become
             // readable again, at which point the stream is terminated.
-            if self.is_readable {
-                if self.eof {
-                    let mut item = self.codec.decode_eof(&mut self.read_buf)?;
-                    item.take_platform_handles(|| self.incoming_fds.take_fds());
-                    return Ok(Some(item).into());
+            if self_.is_readable {
+                if self_.eof {
+                    let mut item = self_.codec.decode_eof(&mut self_.read_buf)?;
+                    item.take_platform_handles(|| self_.incoming_fds.take_fds());
+                    return Poll::Ready(Some(Ok(item)));
                 }
 
                 trace!("attempting to decode a frame");
 
-                if let Some(mut item) = self.codec.decode(&mut self.read_buf)? {
+                if let Some(mut item) = self_.codec.decode(&mut self_.read_buf)? {
                     trace!("frame decoded from buffer");
-                    item.take_platform_handles(|| self.incoming_fds.take_fds());
-                    return Ok(Some(item).into());
+                    item.take_platform_handles(|| self_.incoming_fds.take_fds());
+                    return Poll::Ready(Some(Ok(item)));
                 }
 
-                self.is_readable = false;
+                self_.is_readable = false;
             }
 
-            assert!(!self.eof);
+            assert!(!self_.eof);
 
             // Otherwise, try to read more data and try again. Make sure we've
             // got room for at least one byte to read to ensure that we don't
             // get a spurious 0 that looks like EOF
-            let (n, _) = try_ready!(self
+            let (n, _) = futures::ready!(self_
                 .io
-                .recv_msg_buf(&mut self.read_buf, self.incoming_fds.cmsg()));
+                .recv_msg_buf(cx, &mut self_.read_buf, self_.incoming_fds.cmsg()))?;
 
             if n == 0 {
-                self.eof = true;
+                self_.eof = true;
             }
 
-            self.is_readable = true;
+            self_.is_readable = true;
         }
     }
 }
 
-impl<A, C> Sink for FramedWithPlatformHandles<A, C>
+impl<A, C> Sink<C::In> for FramedWithPlatformHandles<A, C>
 where
-    A: AsyncSendMsg,
-    C: Codec,
+    A: AsyncSendMsg + Unpin,
+    C: Codec + Unpin,
     C::In: AssocRawPlatformHandle + fmt::Debug,
 {
-    type SinkItem = C::In;
-    type SinkError = io::Error;
+    type Error = io::Error;
 
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+    fn start_send(mut self: Pin<&mut Self>, item: C::In) -> Result<(), Self::Error> {
         trace!("start_send: item={:?}", item);
 
-        // If the buffer is already over BACKPRESSURE_THRESHOLD,
-        // then attempt to flush it. If after flush it's *still*
-        // over BACKPRESSURE_THRESHOLD, then reject the send.
-        if self.write_buf.len() > BACKPRESSURE_THRESHOLD {
-            self.poll_complete()?;
-            if self.write_buf.len() > BACKPRESSURE_THRESHOLD {
-                return Ok(AsyncSink::NotReady(item));
-            }
-        }
-
+        let self_ = &mut *self;
         let fds = item.platform_handles();
-        self.codec.encode(item, &mut self.write_buf)?;
+        self_.codec.encode(item, &mut self_.write_buf)?;
         let fds = fds.and_then(|fds| {
-            cmsg::builder(&mut self.outgoing_fds)
+            cmsg::builder(&mut self_.outgoing_fds)
                 .rights(&fds.0[..])
                 .finish()
                 .ok()
@@ -250,26 +241,45 @@ where
         if fds.is_some() {
             // Enforce splitting sends on messages that contain file
             // descriptors.
-            self.set_frame(fds);
+            self_.set_frame(fds);
         }
 
-        Ok(AsyncSink::Ready)
+        Ok(())
     }
 
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
         trace!("flushing framed transport");
 
-        try_ready!(self.do_write());
+        futures::ready!(self.do_write(cx))?;
 
-        try_nb!(self.io.flush());
+        futures::ready!(Pin::new(&mut self.io).poll_flush(cx))?;
 
         trace!("framed transport flushed");
-        Ok(().into())
+        Poll::Ready(Ok(()))
     }
 
-    fn close(&mut self) -> Poll<(), Self::SinkError> {
-        try_ready!(self.poll_complete());
-        self.io.shutdown()
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        trace!("poll_ready");
+        // If the buffer is already over BACKPRESSURE_THRESHOLD,
+        // then attempt to flush it. If after flush it's *still*
+        // over BACKPRESSURE_THRESHOLD, then reject the send.
+        if self.write_buf.len() > BACKPRESSURE_THRESHOLD {
+            if let Poll::Pending = self.poll_flush(cx)? {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            //if self_.write_buf.len() > BACKPRESSURE_THRESHOLD {
+                //return Poll::Pending;
+            //}
+        }
+        return Poll::Ready(Ok(()))
+
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        futures::ready!(self.as_mut().poll_flush(cx))?;
+        // TODO: Probably wrong
+        Pin::new(&mut self.io).poll_close(cx)
     }
 }
 

@@ -3,11 +3,11 @@
 // This program is made available under an ISC-style license.  See the
 // accompanying file LICENSE for details.
 
-use iovec::unix;
-use iovec::IoVec;
 use libc;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::{cmp, io, mem, ptr};
+use std::io::IoSlice;
+use bytes::buf::IoSliceMut;
 
 // Extend sys::os::unix::net::UnixStream to support sending and receiving a single file desc.
 // We can extend UnixStream by using traits, eliminating the need to introduce a new wrapped
@@ -15,19 +15,19 @@ use std::{cmp, io, mem, ptr};
 pub trait RecvMsg {
     fn recv_msg(
         &mut self,
-        iov: &mut [&mut IoVec],
+        iov: &mut [IoSliceMut],
         cmsg: &mut [u8],
     ) -> io::Result<(usize, usize, i32)>;
 }
 
 pub trait SendMsg {
-    fn send_msg(&mut self, iov: &[&IoVec], cmsg: &[u8]) -> io::Result<usize>;
+    fn send_msg(&mut self, iov: &[IoSlice], cmsg: &[u8]) -> io::Result<usize>;
 }
 
 impl<T: AsRawFd> RecvMsg for T {
     fn recv_msg(
         &mut self,
-        iov: &mut [&mut IoVec],
+        iov: &mut [IoSliceMut],
         cmsg: &mut [u8],
     ) -> io::Result<(usize, usize, i32)> {
         #[cfg(target_os = "linux")]
@@ -39,7 +39,7 @@ impl<T: AsRawFd> RecvMsg for T {
 }
 
 impl<T: AsRawFd> SendMsg for T {
-    fn send_msg(&mut self, iov: &[&IoVec], cmsg: &[u8]) -> io::Result<usize> {
+    fn send_msg(&mut self, iov: &[IoSlice], cmsg: &[u8]) -> io::Result<usize> {
         send_msg_with_flags(self.as_raw_fd(), iov, cmsg, 0)
     }
 }
@@ -64,11 +64,11 @@ fn cvt_r<F: FnMut() -> libc::ssize_t>(mut f: F) -> io::Result<usize> {
 
 pub fn recv_msg_with_flags(
     socket: RawFd,
-    bufs: &mut [&mut IoVec],
+    bufs: &mut [IoSliceMut],
     cmsg: &mut [u8],
     flags: libc::c_int,
 ) -> io::Result<(usize, usize, libc::c_int)> {
-    let slice = unix::as_os_slice_mut(bufs);
+    let slice: &mut [libc::iovec] = unsafe { std::mem::transmute(bufs) };
     let len = cmp::min(<libc::c_int>::max_value() as usize, slice.len());
     let (control, controllen) = if cmsg.is_empty() {
         (ptr::null_mut(), 0)
@@ -92,11 +92,11 @@ pub fn recv_msg_with_flags(
 
 pub fn send_msg_with_flags(
     socket: RawFd,
-    bufs: &[&IoVec],
+    bufs: &[IoSlice],
     cmsg: &[u8],
     flags: libc::c_int,
 ) -> io::Result<usize> {
-    let slice = unix::as_os_slice(bufs);
+    let slice: &[libc::iovec] = unsafe { std::mem::transmute(bufs) };
     let len = cmp::min(<libc::c_int>::max_value() as usize, slice.len());
     let (control, controllen) = if cmsg.is_empty() {
         (ptr::null_mut(), 0)

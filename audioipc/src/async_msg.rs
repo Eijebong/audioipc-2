@@ -8,15 +8,15 @@
 #[cfg(unix)]
 use crate::msg::{RecvMsg, SendMsg};
 use bytes::{Buf, BufMut};
+use core::task::{Context, Poll};
 #[cfg(unix)]
-use futures::Async;
-use futures::Poll;
+use std::io::IoSlice;
 #[cfg(unix)]
-use iovec::IoVec;
+use bytes::buf::IoSliceMut;
 #[cfg(unix)]
 use mio::Ready;
 use std::io;
-use tokio_io::{AsyncRead, AsyncWrite};
+use futures_io::{AsyncRead, AsyncWrite};
 
 pub trait AsyncRecvMsg: AsyncRead {
     /// Pull some bytes from this source into the specified `Buf`, returning
@@ -25,7 +25,7 @@ pub trait AsyncRecvMsg: AsyncRead {
     /// The `buf` provided will have bytes read into it and the internal cursor
     /// will be advanced if any bytes were read. Note that this method typically
     /// will not reallocate the buffer provided.
-    fn recv_msg_buf<B>(&mut self, buf: &mut B, cmsg: &mut B) -> Poll<(usize, i32), io::Error>
+    fn recv_msg_buf<B>(&mut self, cx: &mut Context, buf: &mut B, cmsg: &mut B) -> Poll<Result<(usize, i32), io::Error>>
     where
         Self: Sized,
         B: BufMut;
@@ -50,7 +50,7 @@ pub trait AsyncSendMsg: AsyncWrite {
     ///
     /// Note that this method will advance the `buf` provided automatically by
     /// the number of bytes written.
-    fn send_msg_buf<B, C>(&mut self, buf: &mut B, cmsg: &C) -> Poll<usize, io::Error>
+    fn send_msg_buf<B, C>(&mut self, cx: &mut Context, buf: &mut B, cmsg: &C) -> Poll<Result<usize, io::Error>>
     where
         Self: Sized,
         B: Buf,
@@ -61,14 +61,15 @@ pub trait AsyncSendMsg: AsyncWrite {
 
 #[cfg(unix)]
 impl AsyncRecvMsg for super::AsyncMessageStream {
-    fn recv_msg_buf<B>(&mut self, buf: &mut B, cmsg: &mut B) -> Poll<(usize, i32), io::Error>
+    fn recv_msg_buf<B>(&mut self, cx: &mut Context, buf: &mut B, cmsg: &mut B) -> Poll<Result<(usize, i32), io::Error>>
     where
         B: BufMut,
     {
-        if let Async::NotReady =
-            <super::AsyncMessageStream>::poll_read_ready(self, Ready::readable())?
+        if let Poll::Pending =
+            <super::AsyncMessageStream>::poll_read_ready(self, Ready::readable(), cx)?
         {
-            return Ok(Async::NotReady);
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
         let r = unsafe {
             // The `IoVec` type can't have a 0-length size, so we create a bunch
@@ -90,26 +91,27 @@ impl AsyncRecvMsg for super::AsyncMessageStream {
             let b14: &mut [u8] = &mut [0];
             let b15: &mut [u8] = &mut [0];
             let b16: &mut [u8] = &mut [0];
-            let mut bufs: [&mut IoVec; 16] = [
-                b1.into(),
-                b2.into(),
-                b3.into(),
-                b4.into(),
-                b5.into(),
-                b6.into(),
-                b7.into(),
-                b8.into(),
-                b9.into(),
-                b10.into(),
-                b11.into(),
-                b12.into(),
-                b13.into(),
-                b14.into(),
-                b15.into(),
-                b16.into(),
+            let mut bufs: [IoSliceMut; 16] = [
+                IoSliceMut::from(b1),
+                IoSliceMut::from(b2),
+                IoSliceMut::from(b3),
+                IoSliceMut::from(b4),
+                IoSliceMut::from(b5),
+                IoSliceMut::from(b6),
+                IoSliceMut::from(b7),
+                IoSliceMut::from(b8),
+                IoSliceMut::from(b9),
+                IoSliceMut::from(b10),
+                IoSliceMut::from(b11),
+                IoSliceMut::from(b12),
+                IoSliceMut::from(b13),
+                IoSliceMut::from(b14),
+                IoSliceMut::from(b15),
+                IoSliceMut::from(b16),
             ];
-            let n = buf.bytes_vec_mut(&mut bufs);
-            self.recv_msg(&mut bufs[..n], cmsg.bytes_mut())
+            let n = buf.bytes_vectored_mut(&mut bufs);
+            // TODO: Check transmute
+            self.recv_msg(&mut bufs[..n], std::mem::transmute(cmsg.bytes_mut()))
         };
 
         match r {
@@ -120,49 +122,54 @@ impl AsyncRecvMsg for super::AsyncMessageStream {
                 unsafe {
                     cmsg.advance_mut(cmsg_len);
                 }
-                Ok((n, flags).into())
+                Poll::Ready(Ok((n, flags)))
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.clear_read_ready(mio::Ready::readable())?;
-                Ok(Async::NotReady)
+                self.clear_read_ready(mio::Ready::readable(), cx)?;
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
-            Err(e) => Err(e),
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }
 
 #[cfg(unix)]
 impl AsyncSendMsg for super::AsyncMessageStream {
-    fn send_msg_buf<B, C>(&mut self, buf: &mut B, cmsg: &C) -> Poll<usize, io::Error>
+    fn send_msg_buf<B, C>(&mut self, cx: &mut Context, buf: &mut B, cmsg: &C) -> Poll<Result<usize, io::Error>>
     where
         B: Buf,
         C: Buf,
     {
-        if let Async::NotReady = <super::AsyncMessageStream>::poll_write_ready(self)? {
-            return Ok(Async::NotReady);
+        if let Poll::Pending = <super::AsyncMessageStream>::poll_write_ready(self, cx)? {
+            println!("Pending");
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
+        println!("OK");
         let r = {
             // The `IoVec` type can't have a zero-length size, so create a dummy
             // version from a 1-length slice which we'll overwrite with the
             // `bytes_vec` method.
-            static DUMMY: &[u8] = &[0];
-            let nom = <&IoVec>::from(DUMMY);
+            static DUMMY: &[u8] = &[];
+            let nom = IoSlice::new(DUMMY);
             let mut bufs = [
                 nom, nom, nom, nom, nom, nom, nom, nom, nom, nom, nom, nom, nom, nom, nom, nom,
             ];
-            let n = buf.bytes_vec(&mut bufs);
+            let n = buf.bytes_vectored(&mut bufs);
             self.send_msg(&bufs[..n], cmsg.bytes())
         };
         match r {
             Ok(n) => {
                 buf.advance(n);
-                Ok(Async::Ready(n))
+                Poll::Ready(Ok(n))
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.clear_write_ready()?;
-                Ok(Async::NotReady)
+                self.clear_write_ready(cx)?;
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
-            Err(e) => Err(e),
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }

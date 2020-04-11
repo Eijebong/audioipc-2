@@ -12,13 +12,14 @@ use audioipc::rpc;
 use audioipc::shm::{SharedMemMutSlice, SharedMemSlice};
 use cubeb_backend::{ffi, DeviceRef, Error, Result, Stream, StreamOps};
 use futures::Future;
-use futures_cpupool::{CpuFuture, CpuPool};
+use futures::executor::ThreadPool;
 use std::ffi::CString;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use tokio::reactor;
+use tokio::runtime;
+use futures_util::task::SpawnExt;
 
 pub struct Device(ffi::cubeb_device);
 
@@ -54,14 +55,14 @@ struct CallbackServer {
     data_cb: ffi::cubeb_data_callback,
     state_cb: ffi::cubeb_state_callback,
     user_ptr: usize,
-    cpu_pool: CpuPool,
+    cpu_pool: ThreadPool,
     device_change_cb: Arc<Mutex<ffi::cubeb_device_changed_callback>>,
 }
 
 impl rpc::Server for CallbackServer {
     type Request = CallbackReq;
     type Response = CallbackResp;
-    type Future = CpuFuture<Self::Response, ()>;
+    type Future = Box<dyn Future<Output=std::result::Result<Self::Response, ()>> + Unpin>;
     type Transport =
         Framed<audioipc::AsyncMessageStream, LengthDelimitedCodec<Self::Response, Self::Request>>;
 
@@ -91,7 +92,7 @@ impl rpc::Server for CallbackServer {
                 let user_ptr = self.user_ptr;
                 let cb = self.data_cb.unwrap();
 
-                self.cpu_pool.spawn_fn(move || {
+                let fut = futures::future::lazy(move |_| {
                     // TODO: This is proof-of-concept. Make it better.
                     let input_ptr: *const u8 = match input_shm {
                         Some(shm) => shm
@@ -121,24 +122,26 @@ impl rpc::Server for CallbackServer {
 
                         Ok(CallbackResp::Data(nframes as isize))
                     })
-                })
+                });
+                Box::new(self.cpu_pool.spawn_with_handle(fut).unwrap())
             }
             CallbackReq::State(state) => {
                 trace!("stream_thread: State Callback: {:?}", state);
                 let user_ptr = self.user_ptr;
                 let cb = self.state_cb.unwrap();
-                self.cpu_pool.spawn_fn(move || {
+                let fut = futures::future::lazy(move |_| {
                     run_in_callback(|| unsafe {
                         cb(ptr::null_mut(), user_ptr as *mut _, state);
                     });
 
                     Ok(CallbackResp::State)
-                })
+                });
+                Box::new(self.cpu_pool.spawn_with_handle(fut).unwrap())
             }
             CallbackReq::DeviceChange => {
                 let cb = self.device_change_cb.clone();
                 let user_ptr = self.user_ptr;
-                self.cpu_pool.spawn_fn(move || {
+                let fut = futures::future::lazy(move |_| {
                     run_in_callback(|| {
                         let cb = cb.lock().unwrap();
                         if let Some(cb) = *cb {
@@ -151,7 +154,9 @@ impl rpc::Server for CallbackServer {
                     });
 
                     Ok(CallbackResp::DeviceChange)
-                })
+                });
+
+                Box::new(self.cpu_pool.spawn_with_handle(fut).unwrap())
             }
         }
     }
@@ -226,15 +231,13 @@ impl<'ctx> ClientStream<'ctx> {
 
         let (wait_tx, wait_rx) = mpsc::channel();
         ctx.handle()
-            .spawn(futures::future::lazy(move || {
-                let handle = reactor::Handle::default();
+            .spawn(futures::future::lazy(move |_| {
+                let handle = runtime::Handle::current();
                 let stream = stream.into_tokio_ipc(&handle).unwrap();
                 let transport = framed(stream, Default::default());
                 rpc::bind_server(transport, server);
                 wait_tx.send(()).unwrap();
-                Ok(())
-            }))
-            .expect("Failed to spawn CallbackServer");
+            }));
         wait_rx.recv().unwrap();
 
         let stream = Box::into_raw(Box::new(ClientStream {

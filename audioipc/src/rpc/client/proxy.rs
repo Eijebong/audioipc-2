@@ -43,10 +43,12 @@
 // IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use futures::sync::{mpsc, oneshot};
-use futures::{Async, Future, Poll};
+use futures::channel::{mpsc, oneshot};
+use futures::Future;
 use std::fmt;
 use std::io;
+use std::task::{Context, Poll};
+use std::pin::Pin;
 
 /// Message used to dispatch requests to the task managing the
 /// client connection.
@@ -110,17 +112,20 @@ where
 }
 
 impl<Q> Future for Response<Q> {
-    type Item = Q;
-    type Error = io::Error;
+    type Output = Result<Q, io::Error>;
 
-    fn poll(&mut self) -> Poll<Q, io::Error> {
-        match self.inner.poll() {
-            Ok(Async::Ready(res)) => Ok(Async::Ready(res)),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        // TODO: Wrong
+        match Pin::new(&mut self.inner).poll(cx) {
+            Poll::Ready(Ok(res)) => Poll::Ready(Ok(res)),
+            Poll::Pending => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             // Convert oneshot::Canceled into io::Error
-            Err(_) => {
+            Poll::Ready(Err(_)) => {
                 let e = io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe");
-                Err(e)
+                Poll::Ready(Err(e))
             }
         }
     }

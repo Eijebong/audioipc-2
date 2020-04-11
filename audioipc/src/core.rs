@@ -5,10 +5,11 @@
 
 // Ease accessing reactor::Core handles.
 
-use futures::sync::oneshot;
+use futures::channel::oneshot;
 use std::sync::mpsc;
+use std::task::Context;
 use std::{fmt, io, thread};
-use tokio::runtime::current_thread;
+use tokio::runtime::{self, Handle};
 
 struct Inner {
     join: thread::JoinHandle<()>,
@@ -17,11 +18,11 @@ struct Inner {
 
 pub struct CoreThread {
     inner: Option<Inner>,
-    handle: current_thread::Handle,
+    handle: Handle,
 }
 
 impl CoreThread {
-    pub fn handle(&self) -> current_thread::Handle {
+    pub fn handle(&self) -> Handle {
         self.handle.clone()
     }
 }
@@ -46,21 +47,19 @@ impl fmt::Debug for CoreThread {
 pub fn spawn_thread<S, F, D>(name: S, f: F, d: D) -> io::Result<CoreThread>
 where
     S: Into<String>,
-    F: FnOnce() -> io::Result<()> + Send + 'static,
+    F: FnOnce(&mut Context) -> io::Result<()> + Send + 'static,
     D: FnOnce() -> () + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let (handle_tx, handle_rx) = mpsc::channel::<current_thread::Handle>();
+    let (handle_tx, handle_rx) = mpsc::channel::<Handle>();
 
     let join = thread::Builder::new().name(name.into()).spawn(move || {
-        let mut rt =
-            current_thread::Runtime::new().expect("Failed to create current_thread::Runtime");
+        let mut rt = runtime::Builder::new().basic_scheduler().enable_io().build().expect("Failed to create Runtime");
         let handle = rt.handle();
         drop(handle_tx.send(handle.clone()));
 
-        rt.spawn(futures::future::lazy(|| {
-            let _ = f();
-            Ok(())
+        rt.spawn(futures::future::lazy(|cx| {
+            let _ = f(cx);
         }));
 
         let _ = rt.block_on(shutdown_rx);

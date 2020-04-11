@@ -6,7 +6,8 @@
 //! `Encoder`s and `Decoder`s from items to/from `BytesMut` buffers.
 
 use bincode::{self, deserialize, serialized_size};
-use bytes::{BufMut, ByteOrder, BytesMut, LittleEndian};
+use bytes::{Buf, BufMut, BytesMut};
+use bytes::buf::ext::BufMutExt;
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 use std::fmt::Debug;
@@ -83,7 +84,7 @@ impl<In, Out> LengthDelimitedCodec<In, Out> {
             return Ok(None);
         }
 
-        let n = LittleEndian::read_u32(buf.as_ref());
+        let n = buf.get_u32_le();
 
         // Consume the length field
         let _ = buf.split_to(MESSAGE_LENGTH_SIZE);

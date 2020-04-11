@@ -4,11 +4,13 @@
 // accompanying file LICENSE for details
 
 use super::tokio_uds_stream as tokio_uds;
-use futures::Poll;
+use std::task::{Context, Poll};
+use std::pin::Pin;
 use mio::Ready;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net;
-use tokio_io::{AsyncRead, AsyncWrite};
+use futures_io::{AsyncRead, AsyncWrite};
+use tokio::runtime::Handle;
 
 #[derive(Debug)]
 pub struct MessageStream(net::UnixStream);
@@ -31,7 +33,7 @@ impl MessageStream {
 
     pub fn into_tokio_ipc(
         self,
-        handle: &tokio::reactor::Handle,
+        handle: &Handle,
     ) -> std::result::Result<AsyncMessageStream, std::io::Error> {
         Ok(AsyncMessageStream::new(tokio_uds::UnixStream::from_std(
             self.0, handle,
@@ -50,23 +52,24 @@ impl AsyncMessageStream {
         AsyncMessageStream(stream)
     }
 
-    pub fn poll_read_ready(&self, ready: Ready) -> Poll<Ready, std::io::Error> {
-        self.0.poll_read_ready(ready)
+    pub fn poll_read_ready(&self, ready: Ready, cx: &mut Context) -> Poll<Result<Ready, std::io::Error>> {
+        self.0.poll_read_ready(ready, cx)
     }
 
-    pub fn clear_read_ready(&self, ready: Ready) -> Result<(), std::io::Error> {
-        self.0.clear_read_ready(ready)
+    pub fn clear_read_ready(&self, ready: Ready, cx: &mut Context) -> Result<(), std::io::Error> {
+        self.0.clear_read_ready(ready, cx)
     }
 
-    pub fn poll_write_ready(&self) -> Poll<Ready, std::io::Error> {
-        self.0.poll_write_ready()
+    pub fn poll_write_ready(&self, cx: &mut Context) -> Poll<Result<Ready, std::io::Error>> {
+        self.0.poll_write_ready(cx)
     }
 
-    pub fn clear_write_ready(&self) -> Result<(), std::io::Error> {
-        self.0.clear_write_ready()
+    pub fn clear_write_ready(&self, cx: &mut Context) -> Result<(), std::io::Error> {
+        self.0.clear_write_ready(cx)
     }
 }
 
+/* TODO
 impl std::io::Read for AsyncMessageStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.0.read(buf)
@@ -80,21 +83,25 @@ impl std::io::Write for AsyncMessageStream {
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.flush()
     }
-}
+} */
 
 impl AsyncRead for AsyncMessageStream {
-    fn read_buf<B: bytes::BufMut>(&mut self, buf: &mut B) -> futures::Poll<usize, std::io::Error> {
-        <&tokio_uds::UnixStream>::read_buf(&mut &self.0, buf)
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut [u8]) -> Poll<Result<usize, std::io::Error>> {
+        <&tokio_uds::UnixStream>::poll_read(Pin::new(&mut &self.0), cx, buf)
     }
 }
 
 impl AsyncWrite for AsyncMessageStream {
-    fn shutdown(&mut self) -> futures::Poll<(), std::io::Error> {
-        <&tokio_uds::UnixStream>::shutdown(&mut &self.0)
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+        <&tokio_uds::UnixStream>::poll_close(Pin::new(&mut &self.0), cx)
     }
 
-    fn write_buf<B: bytes::Buf>(&mut self, buf: &mut B) -> futures::Poll<usize, std::io::Error> {
-        <&tokio_uds::UnixStream>::write_buf(&mut &self.0, buf)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+        <&tokio_uds::UnixStream>::poll_flush(Pin::new(&mut &self.0), cx)
+    }
+
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<Result<usize, std::io::Error>> {
+        <&tokio_uds::UnixStream>::poll_write(Pin::new(&mut &self.0), cx, buf)
     }
 }
 

@@ -41,11 +41,14 @@
 
 use crate::rpc::driver::Driver;
 use crate::rpc::Handler;
-use futures::sync::oneshot;
-use futures::{Async, Future, Poll, Sink, Stream};
+use futures::channel::oneshot;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use futures::{Sink, Stream};
+use futures_util::{sink::SinkExt};
 use std::collections::VecDeque;
 use std::io;
-use tokio::runtime::current_thread;
+
 
 mod proxy;
 
@@ -54,6 +57,9 @@ pub use self::proxy::{ClientProxy, Response};
 pub fn bind_client<C>(transport: C::Transport) -> proxy::ClientProxy<C::Request, C::Response>
 where
     C: Client,
+    C::Transport: Unpin + Send,
+    C::Response: Send,
+    C::Request: Send
 {
     let (tx, rx) = proxy::channel();
 
@@ -66,9 +72,7 @@ where
         Driver::new(handler)
     };
 
-    // Spawn the RPC driver into task
-    current_thread::spawn(fut.map_err(|_| ()));
-
+    tokio::runtime::Handle::current().spawn(fut);
     tx
 }
 
@@ -81,8 +85,8 @@ pub trait Client: 'static {
 
     /// The message transport, which works with async I/O objects of type `A`
     type Transport: 'static
-        + Stream<Item = Self::Response, Error = io::Error>
-        + Sink<SinkItem = Self::Request, SinkError = io::Error>;
+        + Stream<Item = Result<Self::Response, io::Error>>
+        + Sink<Self::Request, Error = io::Error>;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -90,6 +94,7 @@ pub trait Client: 'static {
 struct ClientHandler<C>
 where
     C: Client,
+    C::Transport: Unpin
 {
     transport: C::Transport,
     requests: proxy::Receiver<C::Request, C::Response>,
@@ -99,13 +104,15 @@ where
 impl<C> Handler for ClientHandler<C>
 where
     C: Client,
+    C::Transport: Unpin
 {
     type In = C::Response;
     type Out = C::Request;
     type Transport = C::Transport;
 
-    fn transport(&mut self) -> &mut Self::Transport {
-        &mut self.transport
+    // TODO: def wrong
+    fn transport(&mut self) -> Pin<&mut Self::Transport> {
+        Pin::new(&mut self.transport)
     }
 
     fn consume(&mut self, response: Self::In) -> io::Result<()> {
@@ -123,28 +130,29 @@ where
     }
 
     /// Produce a message
-    fn produce(&mut self) -> Poll<Option<Self::Out>, io::Error> {
+    fn produce(&mut self, cx: &mut Context) -> Poll<Result<Option<Self::Out>, io::Error>> {
         trace!("ClientHandler::produce");
 
         // Try to get a new request
-        match self.requests.poll() {
-            Ok(Async::Ready(Some((request, complete)))) => {
+        // TODO: Prob wrong
+        match Pin::new(&mut self.requests).poll_next(cx) {
+            Poll::Ready(Some((request, complete))) => {
                 trace!("  --> received request");
 
                 // Track complete handle
                 self.in_flight.push_back(complete);
 
-                Ok(Some(request).into())
+                Poll::Ready(Ok(Some(request)))
             }
-            Ok(Async::Ready(None)) => {
+            Poll::Ready(None) => {
                 trace!("  --> client dropped");
-                Ok(None.into())
+                Poll::Ready(Ok(None))
             }
-            Ok(Async::NotReady) => {
+            Poll::Pending => {
                 trace!("  --> not ready");
-                Ok(Async::NotReady)
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
-            Err(_) => unreachable!(),
         }
     }
 
@@ -154,7 +162,9 @@ where
     }
 }
 
-impl<C: Client> Drop for ClientHandler<C> {
+impl<C: Client> Drop for ClientHandler<C> where
+C::Transport: Unpin
+{
     fn drop(&mut self) {
         let _ = self.transport.close();
         self.in_flight.clear();
